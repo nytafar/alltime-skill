@@ -1,0 +1,1 @@
+"""Adapter internals for /alltime."""
