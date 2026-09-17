@@ -22,7 +22,7 @@ from types import ModuleType
 # The upstream release this adapter was written and seam-tested against.
 # Mismatch is a warning, not a failure -- selftest.py is what actually decides
 # whether the seams still hold.
-PINNED_VERSION = "3.23.0"
+PINNED_VERSION = "3.24.0"
 
 # `lib/__init__.py` does not re-export submodules, and the engine's own import
 # line only pulls the ones its CLI path needs. The source modules this adapter
@@ -39,6 +39,9 @@ REQUIRED_SUBMODULES = (
     "reddit_arctic",
     "arxiv",
     "hackernews",
+    # The repo-scoped issue lane patches this one; it is lazily loaded by the
+    # pipeline like every other source module, so it has to be named here.
+    "github",
     # Not source modules: `pipeline` owns the per-source fetch cap and `http`
     # owns the shared keyless-Reddit throttle, both of which the rate-limit
     # overrides retune. Imported here for the same reason as the rest -- an

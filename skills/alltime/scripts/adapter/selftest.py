@@ -232,6 +232,63 @@ def _seam_arxiv_search_args(lib: ModuleType) -> str:
     return f"{len(args)} args"
 
 
+def _seam_github_scoped_lane(lib: ModuleType) -> str:
+    """Every primitive the repo-scoped issue lane borrows must still be there.
+
+    The lane wraps `search_github` and reuses upstream's endpoint, token
+    resolution, query cleaning, depth table and JSON fetcher. It also depends
+    on the wrapped signature: the pipeline calls it positionally
+    (topic, from_date, to_date) with depth/token as keywords, and the wrapper
+    has to forward both to the original.
+    """
+    import inspect
+
+    mod = lib.github
+    for attr in (
+        "search_github",
+        "SEARCH_URL",
+        "DEPTH_LIMITS",
+        "_fetch_json",
+        "_resolve_token",
+        "strip_search_qualifiers",
+        "extract_core_subject",
+        "token_overlap_relevance",
+        "_log",
+    ):
+        if not hasattr(mod, attr):
+            raise AttributeError(f"github.{attr} missing")
+    params = list(inspect.signature(mod.search_github).parameters)
+    for name in ("topic", "from_date", "to_date", "depth", "token"):
+        if name not in params:
+            raise TypeError(f"search_github no longer takes '{name}' (params={params})")
+    if "search/issues" not in str(mod.SEARCH_URL):
+        raise ValueError(f"github.SEARCH_URL moved: {mod.SEARCH_URL!r}")
+    missing = [d for d in ("quick", "default", "deep") if d not in mod.DEPTH_LIMITS]
+    if missing:
+        raise KeyError(f"github.DEPTH_LIMITS missing depths: {missing}")
+    return f"signature ok, limits={ {k: mod.DEPTH_LIMITS[k] for k in sorted(mod.DEPTH_LIMITS)} }"
+
+
+def _seam_github_envelope(lib: ModuleType) -> str:
+    """The parser must still read its row budget from the envelope context.
+
+    The scoped lane merges extra rows in and raises `context["count"]` to keep
+    them. If the parser stops honouring that key, the extra requests would be
+    spent and then discarded silently -- worse than not scoping at all.
+    """
+    import inspect
+
+    src = inspect.getsource(lib.github.parse_github_response)
+    if 'context.get("count")' not in src:
+        raise ValueError(
+            "parse_github_response no longer reads context['count'] -- scoped "
+            "rows would be fetched and then truncated away"
+        )
+    if "raw_items[:count]" not in src:
+        raise ValueError("parse_github_response truncation shape changed")
+    return "context['count'] honoured"
+
+
 def _seam_hackernews_range(lib: ModuleType) -> str:
     """HN honors the window already -- verify it still does, don't patch it."""
     src = lib.hackernews
@@ -262,6 +319,12 @@ SEAMS = [
     ("arxiv.RECENCY_DAYS", _seam_arxiv_recency, True),
     ("arxiv.DEPTH_CONFIG", _seam_arxiv_depth_config, True),
     ("arxiv._build_search_args", _seam_arxiv_search_args, True),
+    # Scoped GitHub lanes are an aim seam, not a window seam: if one moves, the
+    # run still covers the right window through upstream's own global search.
+    # It just goes back to asking the whole site, which is what this override
+    # exists to stop -- loud about it, but not worth killing a run over.
+    ("github scoped lane", _seam_github_scoped_lane, False),
+    ("github.parse_github_response", _seam_github_envelope, False),
     ("hackernews.search_hackernews", _seam_hackernews_range, False),
 ]
 

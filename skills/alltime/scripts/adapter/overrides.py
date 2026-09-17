@@ -15,9 +15,16 @@ upstream's own docstring calls that a KNOWN LIMITATION -- so `_window_arctic`
 is the override that makes the new lane honour the requested window instead of
 returning the newest N posts regardless of it.
 
+`_deepen_github` is a third kind again: GitHub's window was never the problem
+-- `created:>{from}` honours whatever it is given -- but a keyword issue search
+run over two years returns the whole site's loudest threads rather than the
+field's. That override resolves the topic's repos from GitHub's own repo index
+and adds a scoped issue lane per repo, so depth comes from `repo:` qualifiers
+instead of from asking the unbounded search for more rows.
+
 What needs no patch, because it already honors the requested window:
   hackernews  Algolia `numericFilters: created_at_i>X,created_at_i<Y`
-  github      date-ranged natively
+  github      date-ranged natively (the scoped lane is about aim, not window)
   bird_x      `search_x` builds `since:{from_date}`
   xquik       builds `since:{from_date} until:{to_date}`
 
@@ -29,6 +36,8 @@ from __future__ import annotations
 
 import inspect
 import re
+import threading
+import urllib.parse
 from dataclasses import dataclass, field
 from types import ModuleType
 
@@ -131,6 +140,100 @@ ARCTIC_MIN_LIMIT_PER_SLICE = 5
 ARCTIC_DEADLINE_BASE = 45
 ARCTIC_DEADLINE_PER_SLICE = 20
 ARCTIC_DEADLINE_MAX = 240
+
+
+# --- GitHub: repo-scoped issue lanes ---------------------------------------
+#
+# Upstream asks `/search/issues` for `"{core} created:>{from}"` across all of
+# GitHub, reaction-sorted. Over 30 days that is a reasonable net. Over 730 it
+# is the wrong instrument: the corpus it draws from is ~24x larger, the query
+# is unchanged, and reaction-sorting a two-year global pool surfaces whatever
+# was loudest anywhere -- release threads in unrelated mega-repos, week-long
+# outage postmortems -- ahead of the sustained argument inside the three or
+# four projects that actually own the topic.
+#
+# Upstream already ships the aimed variant: `--github-repo owner/repo` puts the
+# run in project mode. Two things stop that from being the answer here. Project
+# mode returns one repo *card* per repo (stars, README, latest releases,
+# reaction-sorted top issues) rather than windowed discussion; and the resolver
+# that populates it, `resolve.auto_resolve`, is a web search
+# (`"{topic} github profile site:github.com"`) that needs a Brave/Exa/Serper key
+# and answers "what is this product's repo", not "what are this field's repos".
+#
+# So resolution is internalized here, against GitHub's own repo index, and the
+# result is spent on scoped *issue* searches rather than on repo cards:
+#
+#   1. one `/search/repositories` call for the subquery's core subject
+#   2. drop forks/archived, demote awesome-lists, rank by topic overlap x stars
+#   3. one `repo:{owner}/{name} {core} is:issue created:{from}..{to}` search per
+#      repo, reaction-sorted, merged into upstream's own envelope
+#
+# Everything downstream -- `parse_github_response`, the date filter, comment
+# enrichment, rerank, dedupe -- is untouched and never learns the difference.
+
+# Repos to scope per run. 4 is a deliberate floor-not-ceiling: the resolver is
+# ranked, so repo 5 is already materially weaker than repo 1, and each repo
+# costs one search request against an authenticated budget of 30/min.
+GITHUB_SCOPE_REPOS = 4
+
+# Rows per scoped lane. Higher than it looks: these are already `repo:`-bounded
+# and topic-bounded, so the precision floor is much higher than the global
+# lane's, and the cost is per-request not per-row.
+GITHUB_PER_REPO = {"quick": 8, "default": 12, "deep": 20}
+
+# Candidates pulled from the repo index before ranking and truncation.
+GITHUB_REPO_POOL = 25
+
+# Quality floor for a scoped repo, and the reason this override is safe to
+# leave on by default. The repo index answers every query, including the ones
+# it has no business answering: measured, "retrieval augmented generation
+# failure modes" returns six repos, all 0-star personal projects with zero
+# issues, and "sourdough hydration" returns twenty-one of them. Scoping to
+# those would be strictly worse than not scoping -- four requests spent on
+# repos that contain no discussion at all, and four lanes of nothing diluting
+# the global lane's real hits.
+#
+# Stars are standing; open issues are the thing actually being searched. A repo
+# with no issue traffic cannot contribute an issue, however on-topic it is.
+GITHUB_MIN_STARS = 100
+GITHUB_MIN_OPEN_ISSUES = 3
+
+# Below this many survivors, abstain entirely rather than scope to one repo.
+# A single lane is not a field, and the run is better served by upstream's
+# global search than by a keyhole view of whichever project happened to rank
+# first. Measured: "kubernetes operator patterns" yields exactly one survivor,
+# and it is not the centre of that field -- abstaining is the right answer.
+GITHUB_MIN_SCOPE_REPOS = 2
+
+# `is:issue` only on the scoped lanes, deliberately. The global lane queries
+# both partitions and merges them (upstream's comment explains why: `is:issue`
+# alone drops ~87% of matches site-wide, most of it PRs). Inside a single repo
+# that ratio inverts in usefulness -- PR traffic there is dominated by
+# dependabot bumps and merge chatter, while the argument lives in issues -- so
+# scoping to issues halves the request count and raises precision at once.
+GITHUB_SCOPE_QUALIFIER = "is:issue"
+
+# Cap GitHub's per-run fan-out, the same mechanism `_cap_reddit_fetches` uses.
+# Unlike Reddit, subqueries DO differentiate the GitHub query, so this is 2
+# rather than 1 -- two distinct facets are worth two lanes. Without a cap a
+# 4-subquery plan would issue 4 x (2 global + 1 resolve + 4 scoped) = 28 search
+# requests in one burst, against a 30/min authenticated ceiling.
+GITHUB_FETCH_CAP = 2
+
+# `parse_github_response` truncates to `context["count"]` before it does
+# anything else, so the merged pool needs headroom or the scoped rows would be
+# fetched and then thrown away.
+GITHUB_MERGE_HEADROOM = 4
+
+# Repos that are indexes of a field rather than participants in it. They rank
+# highly on topic overlap almost by construction -- the topic is literally
+# their README -- and they carry no discussion: an awesome-list's issues are
+# "add my project" PRs. github-explore's own hard-won lesson, internalized.
+_GITHUB_LIST_REPO = re.compile(
+    r"awesome|curated|cheat[-\s]?sheet|\blists?\b|\bcollection\b|\bresources\b"
+    r"|\bpapers?\b|\bsurvey\b|\bbibliograph",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -511,6 +614,234 @@ def _window_arctic(lib: ModuleType, days: int | None, log: OverrideLog) -> None:
         )
 
 
+def _github_repo_rank(mod: ModuleType, core: str, item: dict) -> tuple:
+    """Sort key for one repo-index hit, best first (descending sort).
+
+    Overlap before stars, bucketed rather than raw, because raw stars would let
+    a 200k-star general-purpose repo that mentions the topic once outrank the
+    2k-star project the topic is *about* -- the exact failure that makes a
+    global keyword search unusable over long windows. Bucketing to one decimal
+    keeps stars as the tiebreak between repos of comparable aboutness.
+    """
+    name = item.get("full_name") or ""
+    desc = item.get("description") or ""
+    stars = item.get("stargazers_count") or 0
+    text = f"{name.replace('/', ' ').replace('-', ' ')} {desc}"
+    try:
+        overlap = float(mod.token_overlap_relevance(core, text))
+    except Exception:  # noqa: BLE001 - relevance is a nicety, stars still rank
+        overlap = 0.0
+    is_list = bool(_GITHUB_LIST_REPO.search(f"{name} {desc}"))
+    return (0 if is_list else 1, round(overlap, 1), stars)
+
+
+def _resolve_scope_repos(
+    mod: ModuleType, core: str, token: str, want: int
+) -> list[str]:
+    """Rank the repos that own `core`, using GitHub's own repo index.
+
+    One request. Forks and archived repos are excluded by the query (`fork:` is
+    off by default in repo search; `archived:false` is explicit), lists are
+    demoted by `_github_repo_rank`, and everything else is ordered by topic
+    overlap then stars.
+
+    Returns `[]` on any failure, which degrades the caller to upstream's
+    unscoped search rather than to nothing.
+    """
+    params = urllib.parse.urlencode(
+        {
+            "q": f"{core} archived:false",
+            "sort": "stars",
+            "order": "desc",
+            "per_page": str(GITHUB_REPO_POOL),
+        }
+    )
+    url = f"https://api.github.com/search/repositories?{params}"
+    data = mod._fetch_json(url, token=token, timeout=20)
+    items = (data or {}).get("items")
+    if not isinstance(items, list) or not items:
+        mod._log(f"[alltime] no repos resolved for {core!r}; scoped lanes skipped")
+        return []
+    eligible = [
+        i
+        for i in items
+        if isinstance(i, dict)
+        and i.get("full_name")
+        and (i.get("stargazers_count") or 0) >= GITHUB_MIN_STARS
+        and (i.get("open_issues_count") or 0) >= GITHUB_MIN_OPEN_ISSUES
+    ]
+    if len(eligible) < GITHUB_MIN_SCOPE_REPOS:
+        mod._log(
+            f"[alltime] {core!r} has no repo landscape to scope to "
+            f"({len(eligible)} of {len(items)} candidates clear "
+            f"{GITHUB_MIN_STARS}*/{GITHUB_MIN_OPEN_ISSUES} open issues); "
+            "keeping the global search"
+        )
+        return []
+    ranked = sorted(
+        eligible, key=lambda i: _github_repo_rank(mod, core, i), reverse=True
+    )
+    repos = [i["full_name"] for i in ranked[:want]]
+    mod._log(f"[alltime] scoping {core!r} to {', '.join(repos)}")
+    return repos
+
+
+def _interleave(primary: list[dict], scoped: list[dict]) -> list[dict]:
+    """Alternate the two lanes instead of re-sorting them into one.
+
+    This looks like a detail and is the whole override. `parse_github_response`
+    scores every row as `0.6 * rank_score + 0.4 * content_score + engagement`,
+    where `rank_score` decays with *arrival index* and floors at 0.3 -- so
+    position in this list is weighted half again as heavily as whether the row
+    is about the topic at all.
+
+    Concatenating and reaction-sorting therefore defeats the point: scoped rows
+    are precise but quiet (a focused llama.cpp thread carries single-digit
+    reactions), so they would all land past the decay floor and score
+    0.6*0.3 + 0.4*1.0 = 0.63, while an off-topic monster from the global lane
+    -- measured, "Rewrite Bun in Rust", 6,161 reactions, on a speculative
+    decoding query -- scores 0.6*1.0 + 0.2 = 0.80 with a content score of zero.
+    The aimed rows would lose to exactly the noise they were added to displace.
+
+    Alternating gives each lane the same positional budget and lets
+    `content_score` break the tie, which is the ordering this skill wants: the
+    global lane still contributes its genuinely-loud on-topic threads, and the
+    scoped lane's rows arrive early enough to be judged on aboutness.
+    """
+    out: list[dict] = []
+    for a, b in zip(primary, scoped):
+        out.append(a)
+        out.append(b)
+    paired = min(len(primary), len(scoped))
+    out.extend(primary[paired:])
+    out.extend(scoped[paired:])
+    return out
+
+
+def _deepen_github(
+    lib: ModuleType,
+    *,
+    scope_repos: int,
+    per_repo: int,
+    pinned: list[str] | None,
+    log: OverrideLog,
+) -> None:
+    """Add a repo-scoped issue lane to the GitHub source.
+
+    Wraps `search_github` rather than replacing it: upstream keeps owning the
+    global lane, the token resolution, the is:issue/is:pull-request partition
+    dance and every error envelope. This adds lanes and merges them into the
+    envelope upstream already returned, so a failure anywhere in the addition
+    leaves a run that is exactly as good as an unpatched one.
+
+    Skipped without a token. The anonymous tier allows ~10 search requests a
+    minute; spending five of them on scoping would starve the lane that already
+    works.
+    """
+    mod = lib.github
+    original = mod.search_github
+    if getattr(original, "_alltime_wrapped", False):
+        return
+
+    cache: dict[str, list[str]] = {}
+    lock = threading.Lock()
+
+    def search_github_scoped(topic, from_date, to_date, depth="default", token=None):
+        envelope = original(topic, from_date, to_date, depth=depth, token=token)
+        try:
+            resolved = mod._resolve_token(token)
+        except Exception:  # noqa: BLE001
+            resolved = None
+        if not resolved:
+            return envelope
+
+        core = mod.strip_search_qualifiers(mod.extract_core_subject(topic)).strip()
+        if not core:
+            return envelope
+
+        # Resolve once per core subject, not once per call: a multi-subquery
+        # plan hits this with several phrasings of one topic, and the repo
+        # index answers them nearly identically.
+        with lock:
+            repos = list(pinned) if pinned else cache.get(core)
+            if repos is None:
+                repos = _resolve_scope_repos(mod, core, resolved, scope_repos)
+                cache[core] = repos
+        if not repos:
+            return envelope
+
+        existing = envelope.get("items") or []
+        seen = {i.get("id") for i in existing if isinstance(i, dict)}
+        scoped: list[dict] = []
+        for repo in repos:
+            q = (
+                f"repo:{repo} {core} {GITHUB_SCOPE_QUALIFIER} "
+                f"created:{from_date}..{to_date}"
+            )
+            params = urllib.parse.urlencode(
+                {
+                    "q": q,
+                    "sort": "reactions",
+                    "order": "desc",
+                    "per_page": str(per_repo),
+                }
+            )
+            data = mod._fetch_json(
+                f"{mod.SEARCH_URL}?{params}", token=resolved, timeout=30
+            )
+            for item in (data or {}).get("items", []):
+                if not isinstance(item, dict):
+                    continue
+                item_id = item.get("id")
+                if item_id in seen:
+                    continue
+                seen.add(item_id)
+                scoped.append(item)
+
+        if not scoped:
+            return envelope
+
+        scoped.sort(
+            key=lambda i: (i.get("reactions") or {}).get("total_count", 0),
+            reverse=True,
+        )
+        merged = _interleave(list(existing), scoped)
+        context = envelope.setdefault("context", {})
+        base = context.get("count") or mod.DEPTH_LIMITS.get(depth, 30)
+        context["count"] = min(len(merged), base * GITHUB_MERGE_HEADROOM)
+        envelope["items"] = merged
+        mod._log(
+            f"[alltime] +{len(scoped)} rows from {len(repos)} scoped repo lanes"
+        )
+        return envelope
+
+    search_github_scoped._alltime_wrapped = True  # type: ignore[attr-defined]
+    search_github_scoped.__name__ = original.__name__
+    search_github_scoped.__doc__ = original.__doc__
+    mod.search_github = search_github_scoped
+    log.add(
+        "github.search_github",
+        "global keyword search",
+        (
+            f"+{len(pinned)} pinned repo lanes x{per_repo}"
+            if pinned
+            else f"+up to {scope_repos} repo-scoped issue lanes x{per_repo} "
+            f"(resolved per subquery, >={GITHUB_MIN_STARS}* and "
+            f">={GITHUB_MIN_OPEN_ISSUES} open issues, else global only)"
+        ),
+    )
+
+
+def _cap_github_fetches(lib: ModuleType, log: OverrideLog) -> None:
+    """Bound GitHub's per-run fan-out now that each fetch costs more requests."""
+    caps = lib.pipeline.MAX_SOURCE_FETCHES
+    before = caps.get("github")
+    if before == GITHUB_FETCH_CAP:
+        return
+    caps["github"] = GITHUB_FETCH_CAP
+    log.add("pipeline.MAX_SOURCE_FETCHES[github]", before, GITHUB_FETCH_CAP)
+
+
 def _widen_arxiv(
     lib: ModuleType,
     days: int | None,
@@ -584,6 +915,10 @@ def apply(
     arxiv_limits: dict[str, int],
     arxiv_sort: str = "relevance",
     arxiv_loose: bool = False,
+    depth: str = "default",
+    github_scope_repos: int = GITHUB_SCOPE_REPOS,
+    github_per_repo: int | None = None,
+    github_repos: list[str] | None = None,
 ) -> OverrideLog:
     """Apply every window override. `days=None` means all-time.
 
@@ -611,4 +946,22 @@ def apply(
         except Exception as exc:  # noqa: BLE001
             log.add("reddit_arctic.fetch_listings", "windowing FAILED", str(exc)[:80])
     _widen_arxiv(lib, days, arxiv_limits, arxiv_sort, arxiv_loose, log)
+    # Not a window seam either: GitHub already honours the window, but a
+    # keyword search aimed at the whole site degrades as the window widens.
+    # Best-effort for the same reason as the archive lane -- losing it costs
+    # aim, not correctness, and upstream's own lane still runs.
+    if github_scope_repos > 0 or github_repos:
+        try:
+            _deepen_github(
+                lib,
+                scope_repos=github_scope_repos,
+                per_repo=github_per_repo or GITHUB_PER_REPO.get(
+                    depth, GITHUB_PER_REPO["default"]
+                ),
+                pinned=github_repos,
+                log=log,
+            )
+            _cap_github_fetches(lib, log)
+        except Exception as exc:  # noqa: BLE001
+            log.add("github.search_github", "scoping FAILED", str(exc)[:80])
     return log

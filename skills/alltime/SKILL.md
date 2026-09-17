@@ -109,6 +109,9 @@ python3 "$SKILL_DIR/scripts/alltime.py" "<topic>" --search <chosen> [flags]
 | `--arxiv-loose` | AND the topic's terms instead of requiring the exact phrase. Use for multi-word topics no paper states verbatim. |
 | `--arxiv-sort` | `relevance` (default), `lastUpdatedDate`, `submittedDate`. |
 | `--explain` | Resolved engine, seam checks, applied overrides, chosen platforms. Researches nothing. |
+| `--gh-repos N` | Repos to scope GitHub's issue search to. Default **4**; `0` restores upstream's global-only search. |
+| `--gh-per-repo N` | Rows per scoped repo lane. Default 8/12/20 by depth. |
+| `--gh-scope a/b,c/d` | Pin the scoped repos instead of resolving them. |
 | `--emit json\|md\|compact` | Passed through to the engine. |
 
 Unrecognized flags pass straight through, so everything in `/last30days --help`
@@ -129,8 +132,47 @@ relevance/rerank/dedupe/fusion stack.
 | arXiv | **patched** — `RECENCY_DAYS` 365 → requested window; results 5/10/20 → 15/40/100 |
 | X | native — builds `since:`/`until:` from the window |
 | Hacker News | native — full archive via Algolia `numericFilters` |
-| GitHub | native — date-ranged |
+| GitHub | window native; **aim patched** — see below |
 | YouTube | native — soft filter `>= from_date`, no ceiling |
+
+### GitHub: scoped instead of unbounded
+
+GitHub's window was never the problem — `created:>{from}` honours whatever it
+is given. The problem is aim. Upstream asks `/search/issues` for
+`"<topic> created:>{from}"` across all of GitHub, reaction-sorted; over 30 days
+that is a reasonable net, but over 730 the corpus is ~24x larger with the same
+query, so reaction-sorting surfaces whatever was loudest *anywhere*. Measured
+on `speculative decoding` over three years: "Rewrite Bun in Rust" (6,161
+reactions) ranked fourth.
+
+So `/alltime` resolves the topic's repos from GitHub's own repo index and adds
+one `repo:owner/name <topic> is:issue created:{from}..{to}` lane per repo:
+
+1. one `/search/repositories` call per subquery's core subject, cached
+2. drop forks and archived, demote awesome-lists and paper lists, keep only
+   repos with **≥100 stars and ≥3 open issues**, rank by topic overlap then stars
+3. one scoped issue search per surviving repo, merged into upstream's envelope
+
+Everything downstream — the parser, the date filter, comment enrichment,
+rerank, dedupe — is untouched. Measured on the same query: 30 items → 70, the
+new ones from `deepseek-ai/DeepSpec`, `z-lab/dflash`, `NVIDIA/Model-Optimizer`
+and `youssofal/MTPLX`, none of which the global lane reached.
+
+Two behaviours are worth knowing:
+
+- **It abstains when there is no landscape.** `sourdough hydration` returns 21
+  repos, all 0-star with no issues; `retrieval augmented generation failure
+  modes` returns six of the same. Below two survivors the lane logs why and
+  leaves the global search alone, because four lanes of nothing is worse than
+  one wide net.
+- **The merge interleaves, it does not re-sort.** `parse_github_response`
+  weights arrival position (0.6) above topical content (0.4), so concatenating
+  and reaction-sorting would bury every scoped row — they are precise but quiet
+  — beneath the loud off-topic ones they exist to displace.
+
+Needs a token (`GITHUB_TOKEN` or `gh auth login`). Without one the lane is
+skipped: the anonymous tier allows ~10 searches a minute, and spending them on
+scoping would starve the search that already works.
 
 ## Seam checks
 
@@ -147,9 +189,9 @@ A failed seam **aborts** the run with the moved seam named. That is the signal
 to update `scripts/adapter/overrides.py` — or, if it recurs, to vendor the
 modules outright. `ALLTIME_ENGINE_DIR` pins a specific engine install.
 
-Pinned to and seam-tested against engine **3.23.0**: fifteen seams, eight
+Pinned to and seam-tested against engine **3.24.0**: seventeen seams, eight
 fatal. The window seams abort. The four rate-limit seams, the two archive-lane
-seams and the Hacker News check only warn — a moved seam there costs Reddit
+seams, the two GitHub-scoping seams and the Hacker News check only warn — a moved seam there costs Reddit
 reach or throttling, not window correctness, and killing a run over it would
 be the worse failure.
 
@@ -174,6 +216,15 @@ be the worse failure.
   recency-only, with no top/hot/new. Slicing widens *when* it looks, not *how*
   it ranks. Engagement ordering still comes from the shreddit lane and from
   the engine's own scoring.
+- **GitHub scoping is only as good as the repo index.** It ranks by stars
+  inside a topic-overlap bucket, and `token_overlap_relevance` saturates near
+  1.0 for most repo descriptions — so in practice stars carry the ranking and
+  the quality floor does the discriminating. A field whose centre of gravity is
+  a repo that never names the topic in its description will be missed; pass
+  `--gh-scope` when you already know the repos.
+- **Scoped lanes query issues only.** PR traffic inside one repo is mostly
+  dependabot and merge chatter, and dropping it halves the request count. The
+  global lane still covers PRs site-wide.
 - **arXiv is relevance-sorted, not exhaustive.** 100 papers at `--deep` is a
   strong sample, not a systematic review.
 - **YouTube is slow.** Roughly 25s added per run; transcripts cost more.

@@ -103,6 +103,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p.add_argument(
+        "--gh-repos",
+        type=int,
+        default=None,
+        help=(
+            "Repos to scope GitHub issue search to, resolved from GitHub's repo "
+            "index (default 4; 0 disables and leaves upstream's global search)"
+        ),
+    )
+    p.add_argument(
+        "--gh-per-repo",
+        type=int,
+        default=None,
+        help="Rows per scoped repo lane (default 8/12/20 by depth)",
+    )
+    p.add_argument(
+        "--gh-scope",
+        default=None,
+        help=(
+            "Pin the scoped repos instead of resolving them, "
+            "e.g. --gh-scope ggml-org/llama.cpp,vllm-project/vllm"
+        ),
+    )
+
+    p.add_argument(
         "--explain",
         action="store_true",
         help="Report the resolved engine, seam checks and window overrides, then exit",
@@ -226,12 +250,23 @@ def main() -> int:
     if args.arxiv_limit is not None:
         limits[depth] = args.arxiv_limit
 
+    pinned_repos = [
+        r.strip() for r in (args.gh_scope or "").split(",")
+        if r.strip() and "/" in r.strip()
+    ] or None
+
     log = overrides.apply(
         lib,
         days=days,
         arxiv_limits=limits,
         arxiv_sort=args.arxiv_sort,
         arxiv_loose=args.arxiv_loose,
+        depth=depth,
+        github_scope_repos=(
+            overrides.GITHUB_SCOPE_REPOS if args.gh_repos is None else args.gh_repos
+        ),
+        github_per_repo=args.gh_per_repo,
+        github_repos=pinned_repos,
     )
     bucket = "all" if days is None else overrides.days_to_reddit_bucket(days)
 

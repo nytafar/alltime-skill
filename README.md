@@ -17,6 +17,7 @@ Concretely:
 
 - **Window overrides.** Reddit's timeframe buckets, the arctic-shift archive lane, and arXiv's `RECENCY_DAYS` / result caps are patched so a multi-year request actually fetches a multi-year candidate pool instead of collapsing to `month`.
 - **A date-sliced archive lane.** Upstream accepts a `timeframe` for arctic-shift and never reads it, so the lane returns the newest N posts regardless of window. `/alltime` replaces it with a version that slices the window and fetches each slice.
+- **Aimed GitHub search.** GitHub's window is fine; its aim is not. A keyword issue search over 730 days returns the whole site's loudest threads — measured on "speculative decoding", "Rewrite Bun in Rust" (6,161 reactions) ranked fourth. `/alltime` resolves the topic's repos from GitHub's own repo index, keeps only those with ≥100 stars and ≥3 open issues, and adds a `repo:`-scoped issue lane for each. Same query: 30 items → 70. When no real landscape exists (concept topics like "sourdough hydration" return only 0-star personal projects) it abstains and says so.
 - **Mandatory platform choice.** The skill probes what this machine can reach, then asks — no silent platform selection, and unreachable sources are dropped with a reason rather than returning an empty section that reads as "nobody discussed this".
 - **Seam checks.** The adapter reaches into upstream internals and upstream ships fast, so every override has a startup check that names the exact seam if it moves. Window seams abort the run; rate-limit and archive seams only warn.
 
@@ -54,7 +55,7 @@ python3 skills/alltime/scripts/alltime.py --list-sources   # what this machine c
 python3 skills/alltime/scripts/alltime.py --explain        # resolved engine + seam checks
 ```
 
-Useful flags: `--all-time`, `--deep` / `--quick`, `--subreddits a,b`, `--arxiv-loose`, `--emit json|md|compact`. Unrecognized flags pass straight through to the engine, so everything in `/last30days --help` still works. `ALLTIME_ENGINE_DIR` pins a specific engine install.
+Useful flags: `--all-time`, `--deep` / `--quick`, `--subreddits a,b`, `--gh-repos N` / `--gh-scope owner/repo,...`, `--arxiv-loose`, `--emit json|md|compact`. Unrecognized flags pass straight through to the engine, so everything in `/last30days --help` still works. `ALLTIME_ENGINE_DIR` pins a specific engine install.
 
 See [`skills/alltime/SKILL.md`](skills/alltime/SKILL.md) for the full flag table, the per-platform window handling, and the honest limits (Reddit's coarse `t=` buckets, flattened recency scoring over long windows, and the archive lane sampling the window rather than sweeping it).
 
