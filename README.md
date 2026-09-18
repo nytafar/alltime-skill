@@ -11,7 +11,7 @@ It is an adapter on top of [`/last30days`](https://github.com/mvanhorn/last30day
 | Question | what happened recently? | what has been concluded? |
 | Window | 30 days, hard | 730 days default, `--all-time` available |
 | Ranked by | engagement + recency | relevance + engagement |
-| Platforms | 8+, engine picks | 6, **the user picks, every run** |
+| Platforms | 8+, engine picks | 7, **the user picks, every run** |
 
 Concretely:
 
@@ -19,6 +19,7 @@ Concretely:
 - **A date-sliced archive lane.** Upstream accepts a `timeframe` for arctic-shift and never reads it, so the lane returns the newest N posts regardless of window. `/alltime` replaces it with a version that slices the window and fetches each slice.
 - **Aimed GitHub search.** GitHub's window is fine; its aim is not. A keyword issue search over 730 days returns the whole site's loudest threads — measured on "speculative decoding", "Rewrite Bun in Rust" (6,161 reactions) ranked fourth. `/alltime` resolves the topic's repos from GitHub's own repo index, keeps only those with ≥100 stars and ≥3 open issues, and adds a `repo:`-scoped issue lane for each. Same query: 30 items → 70. When no real landscape exists (concept topics like "sourdough hydration" return only 0-star personal projects) it abstains and says so.
 - **Mandatory platform choice.** The skill probes what this machine can reach, then asks — no silent platform selection, and unreachable sources are dropped with a reason rather than returning an empty section that reads as "nobody discussed this".
+- **The engine's web search, surfaced.** `/last30days` already ships an open-web source (its `grounding` source, on the `exa` backend); `/alltime` lists it as `web` so it can be chosen like any other platform. Off by default: it needs `EXA_API_KEY` and is billed per search. No new scraper, no new dependency.
 - **Seam checks.** The adapter reaches into upstream internals and upstream ships fast, so every override has a startup check that names the exact seam if it moves. Window seams abort the run; rate-limit and archive seams only warn.
 
 ## What it borrows
@@ -38,7 +39,7 @@ npx skills add nytafar/alltime-skill
 
 Or copy `skills/alltime/` into your agent's skills directory by hand.
 
-Also needs Python 3.12+. Reddit, Hacker News and GitHub need no credentials; arXiv needs `arxiv-pp-cli`, YouTube needs `yt-dlp`, X needs a browser session or API creds.
+Also needs Python 3.12+. Reddit, Hacker News and GitHub need no credentials; arXiv needs `arxiv-pp-cli`, YouTube needs `yt-dlp`, X needs a browser session or API creds, and the optional `web` platform needs `EXA_API_KEY`.
 
 ## Use
 

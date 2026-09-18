@@ -68,9 +68,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Comma-separated platforms. Defaults to the reachable default-on set "
-            "(reddit,x). Also available: arxiv, hackernews, github, youtube. "
-            "Use 'all' to let the engine pick. Run --list-sources to see what "
-            "this machine can actually reach."
+            "(reddit,x). Also available: arxiv, hackernews, github, youtube, web "
+            "(Exa). Use 'all' to let the engine pick. Run --list-sources to see "
+            "what this machine can actually reach."
         ),
     )
     p.add_argument(
