@@ -45,6 +45,7 @@ option descriptions.
 | Hacker News | no | Developer consensus, points, comment counts. |
 | GitHub | no | Issues, discussions, releases, repo activity. |
 | YouTube | no | Long-form talks and full transcripts. Slowest per item. |
+| Web (Exa) | no | Open-web pages and articles. Needs `EXA_API_KEY`. Paid per search. |
 
 Skip the question **only** when the user already named the platforms in their
 request ("search reddit and arxiv for…") or passed `--search` explicitly. If
@@ -134,6 +135,7 @@ relevance/rerank/dedupe/fusion stack.
 | Hacker News | native — full archive via Algolia `numericFilters` |
 | GitHub | window native; **aim patched** — see below |
 | YouTube | native — soft filter `>= from_date`, no ceiling |
+| Web (Exa) | native — `startPublishedDate`/`endPublishedDate` from the window |
 
 ### GitHub: scoped instead of unbounded
 
@@ -229,7 +231,9 @@ be the worse failure.
   strong sample, not a systematic review.
 - **YouTube is slow.** Roughly 25s added per run; transcripts cost more.
 - **No new integrations.** Every platform here is one `/last30days` already
-  wires up. Reach comes from removing ceilings, not from new scrapers.
+  wires up. Reach comes from removing ceilings, not from new scrapers. `web`
+  is the engine's own `grounding` source on its `exa` backend — surfaced here,
+  not added.
 
 ## Requirements
 
@@ -238,3 +242,6 @@ be the worse failure.
 - Reddit, Hacker News and GitHub need nothing. arXiv needs `arxiv-pp-cli`;
   YouTube needs `yt-dlp` (or an SC key); X needs browser session or API creds.
   `--list-sources` reports what is actually reachable.
+- **Web (Exa)** needs `EXA_API_KEY` — the environment, or
+  `~/.config/last30days/.env` where the engine already keeps its other keys.
+  Exa is billed per search, so it stays off by default.

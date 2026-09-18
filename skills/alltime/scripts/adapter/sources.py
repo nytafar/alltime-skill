@@ -1,5 +1,9 @@
 """Platform catalogue and availability probing.
 
+``web`` is the engine's own ``grounding`` source, which resolves to the ``exa``
+backend when ``EXA_API_KEY`` is set. Surfacing it here adds no integration -- it
+un-hides one upstream already ships.
+
 The skill asks the user which platforms to search before every run, so the
 choices offered have to reflect what this machine can actually reach right now
 -- offering YouTube on a box without yt-dlp just produces a silent empty source.
@@ -71,6 +75,13 @@ CATALOGUE: tuple[dict, ...] = (
         blurb="Long-form talks and full transcripts. Slowest source per item.",
         window_note="native: soft filter >= from_date, no ceiling",
     ),
+    dict(
+        key="web",
+        label="Web (Exa)",
+        default_on=False,
+        blurb="Open-web pages and articles via Exa. Needs EXA_API_KEY. Paid per search.",
+        window_note="native: startPublishedDate/endPublishedDate from the requested window",
+    ),
 )
 
 
@@ -102,6 +113,11 @@ def _probe(entry: dict, config: dict, lib: ModuleType) -> tuple[bool, str]:
         except Exception as exc:  # noqa: BLE001 - probing must never abort a run
             return False, f"probe failed: {type(exc).__name__}"
         return False, "no X credentials (AUTH_TOKEN/CT0, xurl, or browser session)"
+
+    if key == "web":
+        if config.get("EXA_API_KEY"):
+            return True, ""
+        return False, "no EXA_API_KEY (export it or add it to ~/.config/last30days/.env)"
 
     if key in ("hackernews", "github"):
         return True, ""  # both reachable unauthenticated
